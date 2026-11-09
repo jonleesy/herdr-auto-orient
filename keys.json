@@ -1,0 +1,6 @@
+{
+  "global": {
+    "cmd-alt-o": "auto-orient.toggle",
+    "cmd-alt-shift-o": "auto-orient.fit"
+  }
+}
