@@ -4,8 +4,11 @@
 // It changes only a tab whose panes are all in one line (one row or one column). It does nothing when it starts,
 // and nothing to a tab that you make or arrange after the change: only a change of window shape starts it again.
 // It moves the terminals with Herdr's own commands (terminal.park, then terminal.keep): the programs keep running.
+// Keyboard focus: a tab with two panes moves by itself; the pane that you type in moves, and for about 0.03 s
+// the other pane has the focus. A tab with three or more panes moves only on the "fit" key, because its move
+// gives the focus to each pane in turn for a moment.
 //
-// Keys (keys.json): "auto-orient.toggle" turns it on and off, "auto-orient.fit" fits the shown tab now.
+// Version 0.1.0. Keys (keys.json): "auto-orient.toggle" turns it on and off, "auto-orient.fit" fits the shown tab now.
 // Herdr gives a mod no window size, so it reads the window bounds from Herdr's window.json ([x, y, width, height]).
 import { View, div } from "gpui-kit";
 import { appHome, readTextFile, focused, panes, spaces, hc, run, notify, nextCommand } from "herdr";
@@ -104,19 +107,19 @@ export default class AutoOrient extends View {
   async fit(cx, tab, shape, manual) {
     this.busy = true;
     try {
-      const note = await this.arrange(cx, tab, shape);
+      const note = await this.arrange(cx, tab, shape, manual);
       this.pending.delete(tab);
       const live = new Set(spaces().flatMap((s) => s.tabs.map((t) => t.id)));
       for (const id of this.pending) if (!live.has(id)) this.pending.delete(id);
       this.remember();
-      if (note && (manual || note.moved)) notify({ title: "Auto orient", body: note.text, level: note.error ? "error" : "info", timeout: note.error ? 8000 : 3000 });
+      if (note && (manual || note.moved || note.tell)) notify({ title: "Auto orient", body: note.text, level: note.error ? "error" : "info", timeout: note.error ? 8000 : 3000 });
     } finally {
       this.busy = false;
     }
   }
 
-  // Returns null when there is nothing to tell, else { text, moved, error }.
-  async arrange(cx, tab, shape) {
+  // Returns null when there is nothing to tell, else { text, moved, error, tell }.
+  async arrange(cx, tab, shape, manual) {
     const space = spaces().find((s) => s.tabs.some((t) => t.id === tab));
     if (space?.machine) return { text: "This tab is on another machine. Auto orient changes only tabs on this computer." };
     const list = panes().filter((p) => p.tab === tab);
@@ -135,37 +138,98 @@ export default class AutoOrient extends View {
     if (!line) return { text: "The panes of this tab are not in one line, so auto orient leaves them as they are." };
     if (line === want) return null;
 
-    // Move every pane after the first: take it out of the tab, then put it back in the new direction.
-    const keepFocus = focused()?.terminal;
-    const [first, ...rest] = list.map((p) => p.terminal);
+    const order = list.map((p) => p.terminal);
     const place = want === "row" ? "right" : "down";
-    const back = want === "row" ? "down" : "right";
-    for (const t of rest) run("terminal.park", { terminal: t });
-    // Out means: herdr-core took the tab label away AND the window no longer lists the terminal.
-    // Before both, terminal.keep fails with "no running terminal".
-    const out = async (t) => !panes().some((p) => p.terminal === t) && !(await this.get(t))?.labels?.["herdr.tab"];
-    const allOut = await this.until(cx, async () => (await Promise.all(rest.map(out))).every(Boolean), WAIT);
-    let last = first;
-    for (const t of rest) {
-      if (allOut || (await out(t))) {
-        if (!(await this.keep(cx, t, tab, last, allOut ? place : back))) {
-          run("terminal.keep", { terminal: t, place: "tab" });
-          return { text: `Herdr did not put terminal ${t} back in this tab. It is in a new tab of its own, and it still runs.`, moved: true, error: true };
-        }
-        last = t;
-      }
-    }
-    if (keepFocus) run("pane.focus", { terminal: keepFocus });
-    if (!allOut) return { text: "Herdr did not take the panes out in time. They are back in their old direction.", moved: true, error: true };
-    return { text: want === "column" ? "The window is tall, so the panes of this tab now stack." : "The window is wide, so the panes of this tab are now side by side.", moved: true };
+    const done = { text: want === "column" ? "The window is tall, so the panes of this tab now stack." : "The window is wide, so the panes of this tab are now side by side.", moved: true };
+    if (order.length === 2) return (await this.moveTwo(cx, tab, order, place)) ?? done;
+    // Three or more panes: the move puts the focus on each pane in turn for a moment, so it happens only on the key.
+    if (!manual) return { text: "This tab has three or more panes. Press Cmd+Alt+Shift+O to fit it when you are not typing.", tell: true };
+    return (await this.moveMany(cx, tab, order, place)) ?? done;
   }
 
-  // Puts terminal t back in the tab, next to terminal `after`. Tries again when an attempt does not take.
+  // Two panes. The pane with the keyboard focus moves, and the other pane stays. While the focused pane is out of
+  // the tab, Herdr gives the focus to the other pane, so this part must be short: it polls every 20 ms.
+  // terminal.keep puts the pane next to the focused pane (the other one) and gives it the focus again.
+  // Measured: the other pane has the focus for about 0.02 s. Returns null when it worked, else a note.
+  async moveTwo(cx, tab, order, place) {
+    const focusNow = focused()?.terminal;
+    const anchor = order.includes(focusNow) ? focusNow : order[1];
+    const other = order.find((t) => t !== anchor);
+    run("terminal.park", { terminal: anchor });
+    if (!(await this.until(cx, () => this.out(anchor), WAIT, 20))) {
+      if (!(await this.out(anchor))) return { text: "Herdr did not take the pane out in time. Nothing moved.", error: true };
+    }
+    if (!(await this.keep(cx, anchor, tab, other, place))) {
+      run("terminal.keep", { terminal: anchor, place: "tab" });
+      return { text: `Herdr did not put terminal ${anchor} back in this tab. It is in a new tab of its own, and it still runs.`, moved: true, error: true };
+    }
+    await this.reorder(cx, tab, order);
+    if (!(await this.refocus(cx, anchor))) return { text: "The panes moved, but the keyboard focus is not on the pane that had it. Click the pane before you type.", moved: true, error: true };
+    return null;
+  }
+
+  // Three or more panes (only on the key). The focused pane stays. The others go out, then back directly after it,
+  // in reverse order, so the result is the focused pane and then the others in order. pane.swap then restores the
+  // old order. A swap does not move the focus. Returns null when it worked, else a note.
+  async moveMany(cx, tab, order, place) {
+    const focusNow = focused()?.terminal;
+    const anchor = order.includes(focusNow) ? focusNow : order[0];
+    if (anchor !== focusNow) run("pane.focus", { terminal: anchor });
+    const others = order.filter((t) => t !== anchor);
+    const back = place === "right" ? "down" : "right";
+    for (const t of others) run("terminal.park", { terminal: t });
+    const allOut = await this.until(cx, async () => (await Promise.all(others.map((t) => this.out(t)))).every(Boolean), WAIT, 20);
+    for (const t of [...others].reverse()) {
+      if (!allOut && panes().some((p) => p.terminal === t)) continue; // never left the tab
+      if (!(await this.keep(cx, t, tab, anchor, allOut ? place : back))) {
+        run("terminal.keep", { terminal: t, place: "tab" });
+        await this.refocus(cx, anchor);
+        return { text: `Herdr did not put terminal ${t} back in this tab. It is in a new tab of its own, and it still runs.`, moved: true, error: true };
+      }
+      run("pane.focus", { terminal: anchor }); // terminal.keep gave the focus to the new pane: give it back at once
+    }
+    await this.reorder(cx, tab, order);
+    const focusOk = await this.refocus(cx, anchor);
+    if (!allOut) return { text: "Herdr did not take the panes out in time. They are back in their old direction.", moved: true, error: true };
+    if (!focusOk) return { text: "The panes moved, but the keyboard focus is not on the pane that had it. Click the pane before you type.", moved: true, error: true };
+    return null;
+  }
+
+  // Out of its tab means: the window no longer lists the terminal AND herdr-core took its tab label away.
+  // Before both, terminal.keep fails with "no running terminal".
+  async out(t) {
+    return !panes().some((p) => p.terminal === t) && !(await this.get(t))?.labels?.["herdr.tab"];
+  }
+
+  // Puts terminal t back in the tab, directly after terminal `after`, which must have the focus.
+  // Tries again when an attempt does not take.
   async keep(cx, t, tab, after, place) {
     for (let i = 0; i < KEEP_TRIES; i++) {
-      run("pane.focus", { terminal: after });
+      if (focused()?.terminal !== after) run("pane.focus", { terminal: after });
       run("terminal.keep", { terminal: t, place });
-      if (await this.until(cx, async () => panes().some((p) => p.terminal === t && p.tab === tab), KEEP_WAIT)) return true;
+      if (await this.until(cx, async () => panes().some((p) => p.terminal === t && p.tab === tab), KEEP_WAIT, 20)) return true;
+    }
+    return false;
+  }
+
+  // Swaps panes until the tab shows the terminals in `order` again. pane.swap moves panes, not the focus.
+  async reorder(cx, tab, order) {
+    for (let i = 0; i < order.length; i++) {
+      const now = panes().filter((p) => p.tab === tab);
+      if (now.length !== order.length || now[i]?.terminal === order[i]) continue;
+      const target = now.find((p) => p.terminal === order[i]);
+      if (!target) continue;
+      run("pane.swap", { pane: now[i].pane, target: target.pane });
+      await this.until(cx, async () => panes().filter((p) => p.tab === tab)[i]?.terminal === order[i], 1000, 20);
+    }
+  }
+
+  // Makes sure that the anchor has the keyboard focus. Returns false when it still does not after 3 tries.
+  async refocus(cx, anchor) {
+    for (let i = 0; i < 3; i++) {
+      if (focused()?.terminal === anchor) return true;
+      run("pane.focus", { terminal: anchor });
+      if (await this.until(cx, async () => focused()?.terminal === anchor, 500, 20)) return true;
     }
     return false;
   }
@@ -188,11 +252,11 @@ export default class AutoOrient extends View {
     try { const r = await hc(["get", terminal, "--json"]); return r.code === 0 ? JSON.parse(r.stdout) : null; } catch { return null; }
   }
 
-  async until(cx, test, ms) {
+  async until(cx, test, ms, step = 150) {
     const end = Date.now() + ms;
     while (Date.now() < end) {
       if (await test()) return true;
-      await cx.sleep(150);
+      await cx.sleep(step);
     }
     return false;
   }
